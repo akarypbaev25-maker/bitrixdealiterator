@@ -1,28 +1,19 @@
 {
-  "name": "b24-deal-batcher",
+  "name": "bitrix-crm-client",
   "version": "1.0.0",
-  "description": "Mass tagging tool for Bitrix24 deals (groups of 150). Local app for Bitrix installation + CLI",
+  "description": "Bitrix24 CRM deal updater",
   "main": "dist/index.js",
   "scripts": {
-  "dev": "ts-node src/index.ts",
-  "build": "tsc",
-  "start": "node dist/index.js"
-},
-"scripts": {
-  "dev": "ts-node src/index.ts",
-  "build": "tsc",
-  "start": "node dist/index.js"
-},
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
   "dependencies": {
-    "axios": "^1.7.7",
-    "dotenv": "^16.4.5",
-    "express": "^4.18.2"
+    "axios": "^1.6.0"
   },
   "devDependencies": {
-    "@types/express": "^4.17.17",
-    "@types/node": "^20.8.1",
-    "ts-node": "^10.9.1",
-    "ts-node-dev": "^2.0.0",
-    "typescript": "^5.5.4"
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.0.0"
   }
 }
