@@ -1,3 +1,6 @@
+import dotenv from "dotenv";
+dotenv.config();
+
 import { BitrixClient } from "./bitrixClient";
 import { DealService, UserField } from "./dealService";
 import { chooseFrom, question, close } from "./cli";
@@ -5,59 +8,100 @@ import { info } from "./logger";
 
 async function main() {
   try {
-    const dryRunInput = (await question("Dry run mode? (yes/no): ")).toLowerCase();
-    const dryRun = dryRunInput === "yes" || dryRunInput === "y";
-
-    const client = new BitrixClient();
+    // Dry run prompt
+    const dry = ((await question("Dry run? (yes/no) [yes]:")) || "yes").toLowerCase().startsWith("y");
+    const client = new BitrixClient(true);
     const svc = new DealService(client);
 
-    info("Получаем воронки...");
+    info("Fetching deal categories...");
     const categories = await svc.getCategories();
-    const category = await chooseFrom(categories, (c: any) => `${c.NAME} (ID=${c.ID})`);
+    const category = await chooseFrom(categories, (c: any) => `${c.NAME} (ID=${c.ID})`, "Выберите воронку (номер or ID):");
 
-    info("Получаем стадии...");
+    info("Fetching stages...");
     const stages = await svc.getStages(Number(category.ID));
-    const stage = await chooseFrom(stages, (s: any) => `${s.NAME} (STATUS_ID=${s.STATUS_ID})`);
+    const stage = await chooseFrom(stages, (s: any) => `${s.NAME} (STATUS_ID=${s.STATUS_ID})`, "Выберите стадию:");
 
-    info("Получаем пользовательские поля сделок...");
-    const fields = await svc.getDealUserFields();
+    info("Fetching user fields...");
+    const ufs = await svc.getDealUserFields();
+    // split into enum and string candidates
+    const enumFields = ufs.filter(f => {
+      const ut = (f as any).USER_TYPE_ID ?? (f as any).TYPE;
+      return ut === "enumeration" || (f.LIST && Array.isArray(f.LIST) && f.LIST.length > 0);
+    });
+    const stringFields = ufs.filter(f => {
+      const ut = (f as any).USER_TYPE_ID ?? (f as any).TYPE;
+      return ut === "string" || ut === "text" || (!ut || ut === null) && String(f.FIELD_NAME).startsWith("UF_");
+    });
 
-    const field = await chooseFrom(fields, (f: any) => `${f.FIELD_NAME} (${f.USER_TYPE_ID})`);
-
-    let chosenValue: string | number = "";
-
-    if (field.USER_TYPE_ID === "enumeration") {
-      const enumValues = await svc.getEnumValuesForField(field);
-      enumValues.forEach((v, i) => info(`${i}: ID=${v.ID} => ${v.VALUE}`));
-
-      const idxStr = await question(`Введите индекс варианта (0..${enumValues.length - 1}): `);
-      const idx = Number(idxStr);
-      chosenValue = enumValues[idx].ID;
+    let field: UserField;
+    let fieldType: "enum" | "string" = "enum";
+    const typeChoice = (await question("Work with enum or string field? [enum]:")) || "enum";
+    if (typeChoice.trim().toLowerCase() === "string") {
+      fieldType = "string";
+      if (stringFields.length === 0) {
+        const manual = (await question("No string fields found. Enter FIELD_NAME (UF_CRM_...):")).trim();
+        field = { ID: manual, FIELD_NAME: manual } as UserField;
+      } else {
+        field = await chooseFrom(stringFields, (f: any) => `${f.FIELD_NAME} / ${f.NAME ?? f.ID}`, "Выберите строковое поле:");
+      }
     } else {
-      chosenValue = await question("Введите строковое значение: ");
+      if (enumFields.length === 0) {
+        info("No enum fields found, switching to string");
+        fieldType = "string";
+        field = await chooseFrom(stringFields, (f: any) => `${f.FIELD_NAME} / ${f.NAME ?? f.ID}`, "Выберите строковое поле:");
+      } else {
+        field = await chooseFrom(enumFields, (f: any) => `${f.FIELD_NAME} / ${f.NAME ?? f.ID}`, "Выберите enum поле:");
+      }
     }
 
-    const maxInput = await question("Максимум сделок для изменения (Enter = все): ");
+    let enumValues: Array<{ ID: string; VALUE?: string; NAME?: string }> = [];
+    if (fieldType === "enum") {
+      enumValues = await svc.getEnumValuesForField(field);
+      if (!enumValues.length) {
+        info("Enum field has no values. Exiting.");
+        close();
+        return;
+      }
+      enumValues.forEach((v, i) => info(`${i}: ID=${v.ID} => ${v.VALUE ?? v.NAME}`));
+    }
+
+    // optional: choose specific enum index to cycle? We'll cycle through enumValues if groups > enumValues.
+    const maxInput = await question("Max deals to process (Enter = all): ");
     const max = maxInput ? Number(maxInput) : Infinity;
 
-    info("Загружаем сделки...");
-    const filter: any = { CATEGORY_ID: Number(category.ID), STAGE_ID: stage.STATUS_ID };
-    const deals = await svc.fetchDealsPaginated(filter, ["*","UF_*"], { DATE_CREATE: "ASC" }, max);
-    info(`Найдено сделок: ${deals.length}`);
+    info("Fetching deals...");
+    const filter: any = { 
+      CATEGORY_ID: Number(category.ID), 
+      STAGE_ID: stage.STATUS_ID 
+    };
 
-    const chunkSize = 150;
-    for (let i = 0; i < deals.length; i += chunkSize) {
-      const subset = deals.slice(i, i + chunkSize);
-      const ids = subset.map((d) => Number(d.ID));
-      await svc.updateDealsByIds(field, chosenValue, ids, dryRun);
-      info(`Блок ${i / chunkSize + 1} обработан`);
+    const deals = await svc.fetchDealsPaginated(filter, ["*", "UF_*"], { DATE_CREATE: "ASC" }, max);
+    info(`Found deals: ${deals.length}`);
+    if (!deals.length) {
+      info("No deals found.");
+      close();
+      return;
     }
 
-    info("Обработка завершена.");
+    const confirm = (await question(`Proceed to mark ${deals.length} deals? (yes/no) [no]:`)).toLowerCase();
+    if (!["y","yes"].includes(confirm)) {
+      info("Aborted by user.");
+      close();
+      return;
+    }
+
+    await svc.tagDealsByGroups(deals, field.FIELD_NAME, {
+      fieldType: fieldType === "enum" ? "enum" : "string",
+      enumValues: enumValues.map(ev => ev.ID),
+      chunkSize: 150,
+      dryRun: dry
+    });
+
+    info("Done.");
     close();
   } catch (err) {
-    console.error("Ошибка:", err);
-    close();
+    console.error("Error:", err);
+    try { close(); } catch {}
   }
 }
 
