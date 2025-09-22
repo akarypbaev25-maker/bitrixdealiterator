@@ -1,12 +1,12 @@
 {
   "name": "b24-deal-batcher",
   "version": "1.0.0",
-  "description": "Mass tagging tool for Bitrix24 deals (groups of 150). Local app for Bitrix installation + CLI",
-  "main": "dist/index.js",
   "scripts": {
-  "dev": "ts-node src/index.ts",
-  "build": "tsc",
-  "start": "node dist/index.js"
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "server": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "cli": "ts-node src/index.ts",
+    "build": "tsc -p .",
+    "start": "node dist/server.js"
   },
   "dependencies": {
     "axios": "^1.7.7",

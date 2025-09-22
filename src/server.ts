@@ -2,6 +2,7 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import dotenv from "dotenv";
+import { BitrixClient, Tokens } from "./bitrixClient";
 import { info, warn } from "./logger";
 
 dotenv.config();
@@ -12,10 +13,32 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const TOKENS_FILE = path.join(process.cwd(), "tokens.json");
+const SETUP_TOKEN = process.env.SETUP_TOKEN; // optional secret to protect manual token set
+
+// Helper: save tokens to file (and log minimal info)
+function saveTokens(tokens: Tokens) {
+  fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2), "utf-8");
+  info("Tokens saved to tokens.json");
+}
+
+// GET health
+app.get("/health", (req, res) => {
+  const exists = fs.existsSync(TOKENS_FILE);
+  res.json({ ok: true, tokens_present: exists });
+});
+
+// GET tokens peek (careful: exposes sensitive data) — disabled unless DEBUG=1
+app.get("/tokens", (req, res) => {
+  if (process.env.DEBUG !== "1") return res.status(403).send("Forbidden");
+  if (!fs.existsSync(TOKENS_FILE)) return res.json({ present: false });
+  const data = fs.readFileSync(TOKENS_FILE, "utf-8");
+  res.type("json").send(data);
+});
 
 /**
- * /install - Bitrix will call this URL when installing the local app.
- * It typically sends JSON body with `auth` containing access_token and refresh_token.
+ * POST /install
+ * Bitrix will send an `auth` object in the POST body when installing.
+ * We accept a few formats and persist tokens.json.
  */
 app.post("/install", (req, res) => {
   try {
@@ -24,11 +47,10 @@ app.post("/install", (req, res) => {
     const domain = body.domain ?? body.DOMAIN ?? (auth && auth.domain) ?? req.query.domain;
 
     if (!auth || !auth.access_token) {
-      res.status(400).send("Missing auth.access_token in install payload");
-      return;
+      return res.status(400).send("Install payload missing auth.access_token");
     }
 
-    const tokens = {
+    const tokens: Tokens = {
       domain,
       access_token: auth.access_token,
       refresh_token: auth.refresh_token ?? auth.refresh_token_key ?? null,
@@ -37,47 +59,59 @@ app.post("/install", (req, res) => {
       raw: body
     };
 
-    fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2), "utf-8");
-    info("Install: tokens saved to tokens.json");
-    res.send("<h2>App installed. Tokens saved.</h2>");
+    saveTokens(tokens);
+
+    // Respond with a friendly message and token summary (no raw token in logs)
+    res.send("<h2>Приложение установлено. Токены сохранены.</h2>");
   } catch (err: any) {
-    warn("Install error", err);
+    warn("Error in /install:", err);
     res.status(500).send("Install error");
   }
 });
 
-// GET /install - support GET for manual testing
-app.get("/install", (req, res) => {
-  const q = req.query as any;
-  const access_token = q["auth[access_token]"] || q["access_token"] || q.AUTH_ID;
-  const refresh_token = q["auth[refresh_token]"] || q["refresh_token"] || q.REFRESH_ID;
-  const domain = q.DOMAIN || q.domain || q.host;
+/**
+ * POST /set-tokens
+ * Manual method to set tokens (useful for initial bootstrap if Bitrix cannot call /install)
+ * Protect with SETUP_TOKEN env var: set SETUP_TOKEN=some-secret in Render env.
+ */
+app.post("/set-tokens", (req, res) => {
+  const provided = req.headers["x-setup-token"] || req.query.setup_token || req.body.setup_token;
+  if (SETUP_TOKEN && String(provided) !== SETUP_TOKEN) {
+    return res.status(403).send("Forbidden: invalid setup token");
+  }
 
-  if (!access_token) return res.status(400).send("Missing access_token in query");
-  const tokens = {
+  const body = req.body;
+  const domain = body.domain || body.DOMAIN;
+  const access_token = body.access_token || body.auth?.access_token;
+  const refresh_token = body.refresh_token || body.auth?.refresh_token || null;
+  const expires_in = body.expires_in ?? null;
+
+  if (!domain || !access_token) return res.status(400).send("domain and access_token required");
+
+  const tokens: Tokens = {
     domain,
     access_token,
-    refresh_token: refresh_token ?? null,
-    expires_in: null,
-    received_at: Date.now(),
-    raw_query: q
+    refresh_token,
+    expires_in,
+    received_at: Date.now()
   };
-  fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2), "utf-8");
-  info("Install GET: tokens saved");
-  res.send("<h2>Install (GET) accepted. Tokens saved.</h2>");
-});
 
-app.post("/handler", (req, res) => {
-  // placeholder for future push events
-  console.log("[handler] event:", JSON.stringify(req.body).slice(0, 2000));
+  saveTokens(tokens);
   res.json({ ok: true });
 });
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true, tokens_present: fs.existsSync(TOKENS_FILE) });
+// simple handler endpoint for push events (placeholder)
+app.post("/handler", (req, res) => {
+  console.log("[handler] incoming:", JSON.stringify(req.body).slice(0, 2000));
+  res.json({ ok: true });
 });
 
-app.listen(PORT, () => {
+app.get("/", (req, res) => {
+  res.send("b24-deal-batcher is up. Use /install to set tokens.");
+});
+
+app.listen(Number(PORT), () => {
   info(`Server listening on port ${PORT}`);
-  info(`Install endpoint POST /install`);
+  info(`Install endpoint: POST /install`);
+  info(`Manual tokens endpoint: POST /set-tokens (protected by SETUP_TOKEN if set)`);
 });

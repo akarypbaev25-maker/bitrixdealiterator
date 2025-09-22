@@ -5,12 +5,48 @@ import { BitrixClient } from "./bitrixClient";
 import { DealService, UserField } from "./dealService";
 import { chooseFrom, question, close } from "./cli";
 import { info } from "./logger";
+import fs from "fs";
+import path from "path";
+
+const TOKENS_FILE = path.join(process.cwd(), "tokens.json");
+
+async function ensureTokensInteractive() {
+  // If tokens.json exists, nothing to do
+  if (fs.existsSync(TOKENS_FILE)) return;
+  console.log("Tokens not found (tokens.json). You can either:");
+  console.log("  1) Install the app in Bitrix (Bitrix will call /install on your deployed URL).");
+  console.log("  2) Paste access_token and domain manually.");
+  const choice = (await question("Выберите 1 или 2 (manual):")) || "2";
+  if (String(choice).trim() === "1") {
+    console.log("Ок. Разверните приложение и установите локальное приложение в Bitrix (Install URL → /install).");
+    return;
+  }
+  const domain = (await question("Введите domain (например yourportal.bitrix24.ru):")).trim();
+  const access = (await question("Введите access_token:")).trim();
+  const refresh = (await question("Введите refresh_token (или Enter):")).trim() || undefined;
+  const tokens = {
+    domain,
+    access_token: access,
+    refresh_token: refresh ?? null,
+    expires_in: null,
+    received_at: Date.now()
+  };
+  fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2), "utf-8");
+  console.log("tokens.json записан. Продолжаем.");
+}
 
 async function main() {
   try {
-    // Dry run prompt
+    // Ensure tokens exist or allow manual set
+    await ensureTokensInteractive();
+
     const dry = ((await question("Dry run? (yes/no) [yes]:")) || "yes").toLowerCase().startsWith("y");
     const client = new BitrixClient(true);
+    if (!client.isConfigured()) {
+      console.error("Client still not configured. Exiting.");
+      close();
+      return;
+    }
     const svc = new DealService(client);
 
     info("Fetching deal categories...");
@@ -30,7 +66,7 @@ async function main() {
     });
     const stringFields = ufs.filter(f => {
       const ut = (f as any).USER_TYPE_ID ?? (f as any).TYPE;
-      return ut === "string" || ut === "text" || (!ut || ut === null) && String(f.FIELD_NAME).startsWith("UF_");
+      return ut === "string" || ut === "text" || (!ut && String(f.FIELD_NAME).startsWith("UF_"));
     });
 
     let field: UserField;
@@ -65,16 +101,11 @@ async function main() {
       enumValues.forEach((v, i) => info(`${i}: ID=${v.ID} => ${v.VALUE ?? v.NAME}`));
     }
 
-    // optional: choose specific enum index to cycle? We'll cycle through enumValues if groups > enumValues.
     const maxInput = await question("Max deals to process (Enter = all): ");
     const max = maxInput ? Number(maxInput) : Infinity;
 
     info("Fetching deals...");
-    const filter: any = { 
-      CATEGORY_ID: Number(category.ID), 
-      STAGE_ID: stage.STATUS_ID 
-    };
-
+    const filter: any = { CATEGORY_ID: Number(category.ID), STAGE_ID: stage.STATUS_ID };
     const deals = await svc.fetchDealsPaginated(filter, ["*", "UF_*"], { DATE_CREATE: "ASC" }, max);
     info(`Found deals: ${deals.length}`);
     if (!deals.length) {

@@ -7,8 +7,8 @@ import { info, debug } from "./logger";
 dotenv.config();
 
 export type Tokens = {
-  domain: string;
-  access_token: string;
+  domain?: string;
+  access_token?: string;
   refresh_token?: string | null;
   expires_in?: number | null;
   received_at?: number | null;
@@ -26,37 +26,75 @@ export type BitrixResponse<T = any> = {
 const TOKENS_PATH = path.join(process.cwd(), "tokens.json");
 
 export class BitrixClient {
-  private tokens: Tokens;
+  private tokens: Tokens | null = null;
+  private autoRefresh: boolean;
 
-  constructor(private readonly autoRefresh = true) {
-    if (!fs.existsSync(TOKENS_PATH)) {
-      throw new Error(`tokens.json not found. Install app via /install or create tokens.json manually at project root.`);
-    }
-    this.tokens = JSON.parse(fs.readFileSync(TOKENS_PATH, "utf-8")) as Tokens;
-    if (!this.tokens.domain || !this.tokens.access_token) {
-      throw new Error("Invalid tokens.json (missing domain or access_token)");
+  constructor(autoRefresh = true) {
+    this.autoRefresh = autoRefresh;
+    // Try to load tokens.json
+    if (fs.existsSync(TOKENS_PATH)) {
+      try {
+        const raw = fs.readFileSync(TOKENS_PATH, "utf-8");
+        this.tokens = JSON.parse(raw) as Tokens;
+        debug("Loaded tokens.json");
+      } catch (e) {
+        debug("Failed to parse tokens.json", e);
+        this.tokens = null;
+      }
+    } else {
+      // fallback: read environment variables (useful on Render)
+      const domain = process.env.BITRIX_DOMAIN;
+      const access = process.env.BITRIX_ACCESS_TOKEN;
+      if (domain && access) {
+        this.tokens = {
+          domain,
+          access_token: access,
+          refresh_token: process.env.BITRIX_REFRESH_TOKEN ?? null,
+          expires_in: process.env.BITRIX_EXPIRES_IN ? Number(process.env.BITRIX_EXPIRES_IN) : null,
+          received_at: Date.now()
+        };
+        // optionally save to file for visibility
+        try {
+          fs.writeFileSync(TOKENS_PATH, JSON.stringify(this.tokens, null, 2), "utf-8");
+          debug("Saved tokens.json from env");
+        } catch (e) {
+          debug("Cannot write tokens.json", e);
+        }
+      } else {
+        this.tokens = null;
+      }
     }
   }
 
-  private saveTokens() {
-    fs.writeFileSync(TOKENS_PATH, JSON.stringify(this.tokens, null, 2), "utf-8");
-    debug("tokens.json updated");
+  isConfigured(): boolean {
+    return !!(this.tokens && this.tokens.domain && this.tokens.access_token);
   }
 
-  private async refreshIfNeeded() {
+  getTokens(): Tokens | null {
+    return this.tokens;
+  }
+
+  saveTokensToFile(tokens: Tokens) {
+    this.tokens = tokens;
+    try {
+      fs.writeFileSync(TOKENS_PATH, JSON.stringify(tokens, null, 2), "utf-8");
+      info("tokens.json saved");
+    } catch (e) {
+      console.error("Failed to save tokens.json:", e);
+    }
+  }
+
+  private async refreshIfNeeded(): Promise<void> {
     if (!this.autoRefresh) return;
-    if (!this.tokens.expires_in || !this.tokens.received_at) return;
+    if (!this.tokens || !this.tokens.expires_in || !this.tokens.received_at) return;
     const expiresAt = (this.tokens.received_at ?? 0) + (this.tokens.expires_in ?? 0) * 1000;
-    // refresh 60s before expiry
-    if (Date.now() < expiresAt - 60_000) return;
-    if (!this.tokens.refresh_token) throw new Error("No refresh_token in tokens.json; re-install app.");
-
+    if (Date.now() < expiresAt - 60_000) return; // still valid
+    if (!this.tokens.refresh_token) throw new Error("No refresh_token available.");
     const client_id = process.env.BITRIX_CLIENT_ID;
     const client_secret = process.env.BITRIX_CLIENT_SECRET;
     if (!client_id || !client_secret) {
-      throw new Error("Missing BITRIX_CLIENT_ID / BITRIX_CLIENT_SECRET for token refresh");
+      throw new Error("Missing BITRIX_CLIENT_ID / BITRIX_CLIENT_SECRET for refresh.");
     }
-
     const url = `https://oauth.bitrix.info/oauth/token/`;
     const params = new URLSearchParams({
       grant_type: "refresh_token",
@@ -64,37 +102,34 @@ export class BitrixClient {
       client_secret,
       refresh_token: this.tokens.refresh_token,
     });
-
-    info("Refreshing access token...");
-    const res = await axios.post(url, params.toString(), {
+    info("Refreshing Bitrix token...");
+    const res: AxiosResponse<any> = await axios.post(url, params.toString(), {
       headers: { "Content-Type": "application/x-www-form-urlencoded" }
     });
-    const data = res.data;
-    this.tokens.access_token = data.access_token;
-    this.tokens.refresh_token = data.refresh_token ?? this.tokens.refresh_token;
-    this.tokens.expires_in = data.expires_in ?? this.tokens.expires_in;
+    const d = res.data;
+    this.tokens.access_token = d.access_token;
+    this.tokens.refresh_token = d.refresh_token ?? this.tokens.refresh_token;
+    this.tokens.expires_in = d.expires_in ?? this.tokens.expires_in;
     this.tokens.received_at = Date.now();
-    this.saveTokens();
+    this.saveTokensToFile(this.tokens);
     info("Token refreshed");
   }
 
-  /**
-   * Универсальный вызов Bitrix: method like 'crm.deal.list' or 'batch'
-   * params will be sent in body; auth param is injected automatically.
-   */
   async call<T = any>(method: string, params: Record<string, any> = {}): Promise<BitrixResponse<T>> {
+    if (!this.isConfigured()) {
+      throw new Error("BitrixClient not configured: no tokens. Use /install or set BITRIX_ACCESS_TOKEN/BITRIX_DOMAIN.");
+    }
     await this.refreshIfNeeded();
-    const url = `https://${this.tokens.domain}/rest/${method}`;
-    const body = { ...params, auth: this.tokens.access_token };
-    debug("Bitrix call", method, body);
+    const url = `https://${this.tokens!.domain}/rest/${method}`;
+    const body = { ...params, auth: this.tokens!.access_token };
+    debug("Calling Bitrix method", method);
     const res: AxiosResponse<any> = await axios.post(url, body, { timeout: 30000 });
     if (!res.data) throw new Error(`Empty response from Bitrix method ${method}`);
     if (res.data.error) throw new Error(`${res.data.error}: ${res.data.error_description || JSON.stringify(res.data)}`);
     return res.data as BitrixResponse<T>;
   }
 
-  // batch helper
   async batch(commands: Record<string, string>) {
-    return this.call<{ [key: string]: any }>("batch", { cmd: commands });
+    return this.call<{ [k: string]: any }>("batch", { cmd: commands });
   }
 }
