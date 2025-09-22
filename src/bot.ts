@@ -308,7 +308,8 @@ bot.on("text", async (ctx) => {
 });
 
 // ----- Run flow: present categories with inline buttons -----
-bot.command("run", async (ctx) => {
+// refactored into a function so both /run and keyboard button work
+async function startRunFlow(ctx: any) {
   const chatId = ctx.chat.id;
   const s = getSession(chatId);
 
@@ -338,7 +339,11 @@ bot.command("run", async (ctx) => {
     error(err);
     await ctx.reply("Ошибка при получении воронок: " + String(err.message || err));
   }
-});
+}
+
+bot.command("run", startRunFlow);
+// <-- HERE: added hears for keyboard button so it triggers the same flow
+bot.hears(["🚀 Запустить обработку"], startRunFlow);
 
 // Callback handlers for inline buttons
 bot.action(/cat_(.+)/, async (ctx) => {
