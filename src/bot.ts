@@ -1,364 +1,431 @@
-import { Telegraf, Markup } from "telegraf";
 import dotenv from "dotenv";
+dotenv.config();
+
+import fs from "fs";
+import path from "path";
+import { Telegraf, Markup } from "telegraf";
 import { BitrixClient } from "./bitrixClient";
 import { DealService, UserField } from "./dealService";
 import { info, warn, error } from "./logger";
-import fs from "fs";
-import path from "path";
 
-dotenv.config();
-
-const BOT_TOKEN = process.env.TG_BOT_TOKEN;
+const BOT_TOKEN = process.env.TG_BOT_TOKEN ?? process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) {
-  console.error("TG_BOT_TOKEN is not set in env");
+  console.error("TG_BOT_TOKEN / TELEGRAM_BOT_TOKEN is required in env");
   process.exit(1);
 }
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// session store in memory per chat id
+// path to tokens.json used by BitrixClient
+const TOKENS_FILE = path.join(process.cwd(), "tokens.json");
+
+// ----- session type -----
 type Session = {
   step?: string;
+
+  // selected tree
   categories?: Array<any>;
   category?: any;
+
   stages?: Array<any>;
   stage?: any;
+
   fields?: UserField[];
   field?: UserField | null;
   fieldType?: "enum" | "string";
+
+  // enum-specific
   enumValues?: Array<{ ID: string; VALUE?: string; NAME?: string }>;
-  useEnumMode?: "cycle" | "single";
+  enumMode?: "cycle" | "single";
   chosenEnumId?: string | null;
+
+  // string-specific
   stringPattern?: string | null;
+
+  // common params
   maxDeals?: number | null;
   dryRun?: boolean | null;
 };
+
 const sessions = new Map<number, Session>();
 
-const TOKENS_FILE = path.join(process.cwd(), "tokens.json");
-
-function getSession(ctx: any): Session {
-  const id = ctx.chat.id;
-  if (!sessions.has(id)) sessions.set(id, {});
-  return sessions.get(id)!;
+function getSession(chatId: number): Session {
+  if (!sessions.has(chatId)) sessions.set(chatId, {});
+  return sessions.get(chatId)!;
 }
 
-// Helpers
-async function createClientIfConfigured(): Promise<BitrixClient> {
-  const client = new BitrixClient(true);
-  if (!client.isConfigured()) throw new Error("Bitrix tokens not found. Use /set_tokens or install the app in Bitrix.");
-  return client;
+// helper: create client only when tokens exist
+function clientConfigured(): boolean {
+  if (fs.existsSync(TOKENS_FILE)) return true;
+  // also allow direct env tokens
+  if (process.env.BITRIX_DOMAIN && process.env.BITRIX_ACCESS_TOKEN) return true;
+  return false;
 }
 
-// start
+// Start command
 bot.start(async (ctx) => {
-  sessions.set(ctx.chat.id, {});
-  await ctx.reply("Привет! Я бот-интерфейс для массовой разметки сделок (по 150).", Markup.keyboard([
-    ["🚀 Запустить обработку сделок"],
-    ["⚙️ Установить токены (ручной)"],
-    ["ℹ️ Статус"],
-  ]).resize());
-});
-
-// status
-bot.hears(["ℹ️ Статус", "/status"], async (ctx) => {
-  const session = getSession(ctx);
-  const tokensExist = fs.existsSync(TOKENS_FILE);
-  const parts = [
-    `Tokens present: ${tokensExist ? "✅" : "❌"}`,
-    `Selected category: ${session.category?.NAME ?? "—"}`,
-    `Selected stage: ${session.stage?.NAME ?? "—"}`,
-    `Selected field: ${session.field?.FIELD_NAME ?? "—"}`,
-    `Field type: ${session.fieldType ?? "—"}`,
-  ];
-  await ctx.reply(parts.join("\n"));
-});
-
-// set tokens manual
-bot.hears(["⚙️ Установить токены (ручной)", "/set_tokens"], async (ctx) => {
   const chatId = ctx.chat.id;
-  const session = getSession(ctx);
-  session.step = "awaiting_tokens_domain";
+  sessions.set(chatId, {});
+  await ctx.reply(
+    "Привет! Я бот-интерфейс для массовой разметки сделок (по 150).",
+    Markup.keyboard([["🚀 Запустить обработку"], ["⚙️ Установить токены (ручной)"], ["ℹ️ Статус"]]).resize()
+  );
+});
+
+// Status
+bot.hears(["ℹ️ Статус", "/status"], async (ctx) => {
+  const chatId = ctx.chat.id;
+  const s = getSession(chatId);
+  const tokensPresent = clientConfigured();
+  const lines = [
+    `Tokens present: ${tokensPresent ? "✅" : "❌"}`,
+    `Category: ${s.category?.NAME ?? "—"}`,
+    `Stage: ${s.stage?.NAME ?? "—"}`,
+    `Field: ${s.field?.FIELD_NAME ?? "—"}`,
+    `Field type: ${s.fieldType ?? "—"}`,
+  ];
+  await ctx.reply(lines.join("\n"));
+});
+
+// Manual token set via bot (interactive)
+bot.hears(["⚙️ Установить токены (ручной)", "/set_tokens", "/settokens"], async (ctx) => {
+  const chatId = ctx.chat.id;
+  const s = getSession(chatId);
+  s.step = "awaiting_tokens_domain";
   await ctx.reply("Введите domain (например yourportal.bitrix24.ru):");
 });
 
-// token entry flow
+// Route generic text messages (handles many steps)
 bot.on("text", async (ctx) => {
-  const session = getSession(ctx);
-  const text = (ctx.message && (ctx.message as any).text) || "";
+  const chatId = ctx.chat.id;
+  const s = getSession(chatId);
+  const text = (ctx.message as any).text?.trim() ?? "";
 
   try {
-    // token manual flow
-    if (session.step === "awaiting_tokens_domain") {
-      session.step = "awaiting_tokens_access";
-      session as any; // eslint
-      (session as any).tmpDomain = text.trim();
+    // --- token manual flow ---
+    if (s.step === "awaiting_tokens_domain") {
+      (s as any).tmpDomain = text;
+      s.step = "awaiting_tokens_access";
       await ctx.reply("Введите access_token:");
       return;
     }
-    if (session.step === "awaiting_tokens_access") {
-      const domain = (session as any).tmpDomain;
-      const access = text.trim();
-      session.step = undefined;
-      // optional: ask for refresh
-      await ctx.reply("Если есть refresh_token, введите его сейчас (или отправьте пустое сообщение Enter):");
-      session.step = "awaiting_tokens_refresh";
-      (session as any).tmpAccess = access;
+    if (s.step === "awaiting_tokens_access") {
+      (s as any).tmpAccess = text;
+      s.step = "awaiting_tokens_refresh";
+      await ctx.reply("Если есть refresh_token, отправьте его сейчас (или просто Enter):");
       return;
     }
-    if (session.step === "awaiting_tokens_refresh") {
-      const domain = (session as any).tmpDomain;
-      const access = (session as any).tmpAccess;
-      const refresh = text.trim() || null;
+    if (s.step === "awaiting_tokens_refresh") {
+      const domain = (s as any).tmpDomain;
+      const access = (s as any).tmpAccess;
+      const refresh = text || null;
       const tokens = {
         domain,
         access_token: access,
         refresh_token: refresh,
-        received_at: Date.now()
+        received_at: Date.now(),
       };
       fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2), "utf-8");
-      session.step = undefined;
+      s.step = undefined;
       await ctx.reply("Токены сохранены в tokens.json ✅");
       return;
     }
 
-    // field index flow (when we sent numbered list and asked to reply with index)
-    if (session.step === "awaiting_field_index") {
-      const idx = Number(text.trim());
-      if (Number.isNaN(idx) || !session.fields || idx < 0 || idx >= session.fields.length) {
+    // --- awaiting field index (user types index after seeing numbered list) ---
+    if (s.step === "awaiting_field_index") {
+      const idx = Number(text);
+      if (Number.isNaN(idx) || !s.fields || idx < 0 || idx >= s.fields.length) {
         await ctx.reply("Неверный индекс поля. Введите корректный индекс из списка.");
         return;
       }
-      session.field = session.fields[idx];
-      // determine type
-      const ut = (session.field as any).USER_TYPE_ID ?? (session.field as any).TYPE;
-      if (ut === "enumeration" || ((session.field as any).LIST && Array.isArray((session.field as any).LIST) && (session.field as any).LIST.length > 0)) {
-        session.fieldType = "enum";
-        // fetch enum values
+      s.field = s.fields[idx];
+      // detect type
+      const ut = (s.field as any).USER_TYPE_ID ?? (s.field as any).TYPE;
+      if (ut === "enumeration" || ((s.field as any).LIST && Array.isArray((s.field as any).LIST) && (s.field as any).LIST.length > 0)) {
+        s.fieldType = "enum";
+        // fetch enum values via DealService if possible
         try {
-          const clientTmp = await createClientIfConfigured();
-          const svcTmp = new DealService(clientTmp);
-          const enums = await svcTmp.getEnumValuesForField(session.field!);
-          session.enumValues = enums;
+          const client = new BitrixClient(true);
+          const svc = new DealService(client);
+          s.enumValues = await svc.getEnumValuesForField(s.field!);
         } catch (err) {
-          session.enumValues = (session.field as any).LIST ?? [];
+          // fallback to field.LIST
+          s.enumValues = (s.field as any).LIST ?? [];
         }
 
-        if (!session.enumValues || session.enumValues.length === 0) {
-          await ctx.reply("Поле enum не содержит вариантов. Выберите другое поле или используйте строковое поле.");
-          session.step = undefined;
+        if (!s.enumValues || s.enumValues.length === 0) {
+          await ctx.reply("Enum поле не содержит вариантов. Попробуйте другое поле или используйте строковое поле.");
+          s.step = undefined;
           return;
         }
 
-        // ask mode: cycle or single value
-        session.step = "awaiting_enum_mode";
-        await ctx.reply("Выберите режим для enum поля:\n1 — Циклически использовать варианты (рекомендовано)\n2 — Выбрать один вариант для всех групп\nОтправьте 1 или 2.");
+        // Ask enum mode
+        s.step = "awaiting_enum_mode";
+        await ctx.reply(
+          "Enum поле выбрано. Выберите режим:\n1 — Циклически (каждой группе своё значение циклично)\n2 — Один вариант для всех групп\nОтправьте 1 или 2."
+        );
         return;
       } else {
         // string field
-        session.fieldType = "string";
-        session.step = "awaiting_string_pattern";
-        await ctx.reply("Введите строковый шаблон для групп. Используйте {n} как placeholder для номера группы.\nПример: 'Group {n}' или просто '{n}' (по умолчанию).");
+        s.fieldType = "string";
+        s.step = "awaiting_string_pattern";
+        await ctx.reply("Введите строковый шаблон (используйте {n} как placeholder для номера группы). Пример: 'Group {n}' или просто '{n}':");
         return;
       }
     }
 
-    if (session.step === "awaiting_enum_mode") {
-      const v = text.trim();
-      if (v !== "1" && v !== "2") {
+    // --- enum mode choice ---
+    if (s.step === "awaiting_enum_mode") {
+      if (text !== "1" && text !== "2") {
         await ctx.reply("Отправьте 1 или 2.");
         return;
       }
-      if (v === "1") {
-        session.useEnumMode = "cycle";
-        session.step = "awaiting_max";
-        await ctx.reply("Режим: циклический. Введите максимум сделок для обработки (Enter = все):");
+      if (text === "1") {
+        s.enumMode = "cycle";
+        s.step = "awaiting_max";
+        await ctx.reply("Режим: cycling. Введите максимум сделок для обработки (Enter = все):");
         return;
       } else {
-        session.useEnumMode = "single";
-        // present enum values numbered for selection
-        const lines = session.enumValues!.map((ev, i) => `${i}: ID=${ev.ID} -> ${ev.VALUE ?? ev.NAME}`);
+        s.enumMode = "single";
+        // present enum values and ask index
+        const lines = s.enumValues!.map((ev, i) => `${i}: ID=${ev.ID} -> ${ev.VALUE ?? ev.NAME}`);
         await ctx.reply("Варианты enum:\n" + lines.join("\n"));
-        session.step = "awaiting_enum_index";
-        await ctx.reply(`Введите индекс варианта (0..${session.enumValues!.length - 1}):`);
+        s.step = "awaiting_enum_index";
+        await ctx.reply(`Введите индекс варианта (0..${s.enumValues!.length - 1}):`);
         return;
       }
     }
 
-    if (session.step === "awaiting_enum_index") {
-      const idx = Number(text.trim());
-      if (Number.isNaN(idx) || !session.enumValues || idx < 0 || idx >= session.enumValues.length) {
-        await ctx.reply("Неверный индекс. Попробуйте снова.");
+    if (s.step === "awaiting_enum_index") {
+      const idx = Number(text);
+      if (Number.isNaN(idx) || !s.enumValues || idx < 0 || idx >= s.enumValues.length) {
+        await ctx.reply("Неверный индекс enum-значения. Попробуйте снова.");
         return;
       }
-      session.chosenEnumId = session.enumValues[idx].ID;
-      session.step = "awaiting_max";
+      s.chosenEnumId = s.enumValues[idx].ID;
+      s.step = "awaiting_max";
       await ctx.reply("Введите максимум сделок для обработки (Enter = все):");
       return;
     }
 
-    if (session.step === "awaiting_string_pattern") {
-      const pattern = text.trim() || "{n}";
-      session.stringPattern = pattern;
-      session.step = "awaiting_max";
+    // --- string pattern provided ---
+    if (s.step === "awaiting_string_pattern") {
+      s.stringPattern = text || "{n}";
+      s.step = "awaiting_max";
       await ctx.reply("Введите максимум сделок для обработки (Enter = все):");
       return;
     }
 
-    if (session.step === "awaiting_max") {
-      const max = text.trim() ? Number(text.trim()) : Infinity;
-      session.maxDeals = max;
-      session.step = "awaiting_dry";
+    // --- max deals ---
+    if (s.step === "awaiting_max") {
+      s.maxDeals = text ? Number(text) : Infinity;
+      s.step = "awaiting_dry";
       await ctx.reply("Dry run? Отправьте yes (по умолчанию) или no:");
       return;
     }
 
-    if (session.step === "awaiting_dry") {
-      const dry = !text.trim() ? true : (String(text.trim()).toLowerCase().startsWith("y"));
-      session.dryRun = dry;
-      session.step = "confirm_run";
-      // show summary
+    // --- dry run ---
+    if (s.step === "awaiting_dry") {
+      s.dryRun = !text ? true : String(text).toLowerCase().startsWith("y");
+      s.step = "confirm_run";
+      // summary
       const summary = [
-        `Сводка перед запуском:`,
-        `Воронка: ${session.category?.NAME ?? "—"}`,
-        `Стадия: ${session.stage?.NAME ?? "—"}`,
-        `Поле: ${session.field?.FIELD_NAME ?? "—"}`,
-        `Тип поля: ${session.fieldType}`,
-        session.fieldType === "string" ? `Шаблон: ${session.stringPattern}` : session.useEnumMode === "cycle" ? `Enum: cycling ${session.enumValues!.length} values` : `Enum: single ID=${session.chosenEnumId}`,
-        `Max deals: ${session.maxDeals === Infinity ? "all" : session.maxDeals}`,
-        `Dry run: ${session.dryRun ? "yes" : "no"}`
+        `Сводка:`,
+        `Воронка: ${s.category?.NAME ?? "—"}`,
+        `Стадия: ${s.stage?.NAME ?? "—"}`,
+        `Поле: ${s.field?.FIELD_NAME ?? "—"}`,
+        `Тип: ${s.fieldType}`,
+        s.fieldType === "string" ? `Шаблон: ${s.stringPattern}` : s.enumMode === "cycle" ? `Enum: cycle (${s.enumValues!.length} values)` : `Enum single: ${s.chosenEnumId}`,
+        `Max deals: ${s.maxDeals === Infinity ? "all" : s.maxDeals}`,
+        `Dry run: ${s.dryRun ? "yes" : "no"}`,
       ].join("\n");
       await ctx.reply(summary);
-      await ctx.reply("Подтвердить запуск? Отправьте 'yes' или 'no'.");
+      await ctx.reply("Подтвердить запуск? yes / no");
       return;
     }
 
-    if (session.step === "confirm_run") {
-      const yes = String(text.trim()).toLowerCase().startsWith("y");
+    // --- confirmation ---
+    if (s.step === "confirm_run") {
+      const yes = String(text).toLowerCase().startsWith("y");
       if (!yes) {
-        session.step = undefined;
+        s.step = undefined;
         await ctx.reply("Операция отменена.");
         return;
       }
-      // proceed to run: must have client configured
+
+      // final run
+      if (!clientConfigured()) {
+        await ctx.reply("Bitrix не настроен (нет токенов). Установите токены через /set_tokens или установите приложение в Bitrix для автоматической передачи токенов в /install.");
+        s.step = undefined;
+        return;
+      }
+
+      await ctx.reply("Загружаю сделки (это может занять время)...");
       try {
         const client = new BitrixClient(true);
-        if (!client.isConfigured()) {
-          await ctx.reply("Bitrix не настроен (нет токенов). Установите токены через /set_tokens или установите локальное приложение в Bitrix.");
-          session.step = undefined;
-          return;
-        }
         const svc = new DealService(client);
-        // fetch deals with filter
-        const filter: any = { CATEGORY_ID: Number(session.category.ID), STAGE_ID: session.stage.STATUS_ID ?? session.stage.ID };
-        await ctx.reply("Загружаем сделки (это может занять время)...");
-        const deals = await svc.fetchDealsPaginated(filter, ["*", "UF_*"], { DATE_CREATE: "ASC" }, session.maxDeals ?? Infinity);
+        const filter: any = { CATEGORY_ID: Number(s.category.ID), STAGE_ID: s.stage.STATUS_ID ?? s.stage.ID };
+
+        const deals = await svc.fetchDealsPaginated(filter, ["*", "UF_*"], { DATE_CREATE: "ASC" }, s.maxDeals ?? Infinity);
         await ctx.reply(`Найдено сделок: ${deals.length}`);
-        if (!deals.length) {
-          session.step = undefined;
+        if (deals.length === 0) {
+          s.step = undefined;
           return;
         }
 
-        // progress callback sends messages after each group
-        let lastGroupTime = Date.now();
-        await svc.tagDealsByGroups(deals, session.field!.FIELD_NAME, {
-          fieldType: session.fieldType === "string" ? "string" : "enum",
-          enumValues: session.fieldType === "enum" ? (session.useEnumMode === "cycle" ? session.enumValues!.map(ev => ev.ID) : [session.chosenEnumId!]) : undefined,
+        let lastUpdate = 0;
+        await svc.tagDealsByGroups(deals, s.field!.FIELD_NAME, {
+          fieldType: s.fieldType === "string" ? "string" : "enum",
+          enumValues: s.fieldType === "enum" ? (s.enumMode === "cycle" ? s.enumValues!.map(e => e.ID) : [s.chosenEnumId!]) : undefined,
           chunkSize: 150,
-          dryRun: !!session.dryRun,
-          stringPattern: session.stringPattern ?? "{n}",
+          dryRun: !!s.dryRun,
+          stringPattern: s.stringPattern ?? "{n}",
           progressCb: async (info) => {
-            // throttle updates to not spam the chat too often
             const now = Date.now();
-            if (now - lastGroupTime < 2000) return;
-            lastGroupTime = now;
-            await ctx.reply(`Группа ${info.groupIndex}/${info.totalGroups} обработана — обработано ${info.processed} из ${deals.length}`);
+            if (now - lastUpdate < 1500) return; // throttle to ~1.5s
+            lastUpdate = now;
+            await ctx.reply(`Processed group ${info.groupIndex}/${info.totalGroups} — processed: ${info.processed}/${deals.length}`);
           }
         });
 
-        await ctx.reply(`✅ Обработка завершена. (dry=${session.dryRun ? "yes" : "no"})`);
-        session.step = undefined;
-        return;
+        await ctx.reply(`✅ Обработка завершена (dry=${s.dryRun ? "yes" : "no"}).`);
       } catch (err: any) {
         error("Processing error:", err);
-        await ctx.reply(`Ошибка при обработке: ${String(err.message || err)}`);
-        session.step = undefined;
-        return;
+        await ctx.reply(`Ошибка: ${String(err.message || err)}`);
+      } finally {
+        s.step = undefined;
       }
+      return;
     }
 
-    // If no session step matched: ignore or help
+    // If none of the above matched, show help or ignore
+    // Do nothing special for other arbitrary text
   } catch (err: any) {
-    console.error("Bot handler error:", err);
+    error("Bot text handler error:", err);
     await ctx.reply("Произошла внутренняя ошибка. Смотрите логи.");
+    s.step = undefined;
   }
 });
 
-// Run flow start via button
-bot.hears(["🚀 Запустить обработку сделок", "/run"], async (ctx) => {
-  const session = getSession(ctx);
-  // Ensure client configured
-  const client = new BitrixClient(true);
-  if (!client.isConfigured()) {
-    await ctx.reply("Bitrix не настроен. Установите токены через /set_tokens или используйте /install (при установке в Bitrix).");
+// ----- Run flow: present categories with inline buttons -----
+bot.command("run", async (ctx) => {
+  const chatId = ctx.chat.id;
+  const s = getSession(chatId);
+
+  if (!clientConfigured()) {
+    await ctx.reply("Bitrix не настроен. Установите токены через /set_tokens или установите локальное приложение в Bitrix (Install -> /install).");
     return;
   }
-  const svc = new DealService(client);
-  // fetch categories
-  const cats = await svc.getCategories();
-  session.categories = cats;
-  if (!cats.length) {
-    await ctx.reply("Воронки не найдены.");
-    return;
+
+  try {
+    const client = new BitrixClient(true);
+    const svc = new DealService(client);
+
+    const cats = await svc.getCategories();
+    s.categories = cats;
+
+    if (!cats.length) {
+      await ctx.reply("Воронки не найдены.");
+      return;
+    }
+
+    const buttons = cats.map((c: any) => Markup.button.callback(c.NAME, `cat_${c.ID}`));
+    // chunk into rows of 2
+    const rows: any[][] = [];
+    for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+    await ctx.reply("Выберите воронку:", Markup.inlineKeyboard(rows));
+  } catch (err: any) {
+    error(err);
+    await ctx.reply("Ошибка при получении воронок: " + String(err.message || err));
   }
-  // build inline keyboard
-  const buttons = cats.map(c => Markup.button.callback(c.NAME, `cat_${c.ID}`));
-  // chunk into rows of 2
-  const rows: any[][] = [];
-  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
-  await ctx.reply("Выберите воронку:", Markup.inlineKeyboard(rows));
 });
 
-// callback handlers for category & stage selection
+// Callback handlers for inline buttons
 bot.action(/cat_(.+)/, async (ctx) => {
-  const id = ctx.match[1];
-  const session = getSession(ctx);
-  const client = new BitrixClient(true);
-  const svc = new DealService(client);
-  const category = session.categories?.find((c: any) => String(c.ID) === String(id));
-  session.category = category;
-  // fetch stages
-  const stages = await svc.getStages(Number(category.ID));
-  session.stages = stages;
-  if (!stages.length) {
-    await ctx.reply("Стадии не найдены для этой воронки.");
+  const id = ctx.match![1];
+  const chatId = ctx.chat!.id;
+  const s = getSession(chatId);
+  if (!s.categories) return;
+  const cat = s.categories.find((c: any) => String(c.ID) === String(id));
+  if (!cat) {
+    await ctx.answerCbQuery("Категория не найдена");
     return;
   }
-  const buttons = stages.map(s => Markup.button.callback(s.NAME, `stage_${s.STATUS_ID}`));
-  const rows: any[][] = [];
-  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+  s.category = cat;
   await ctx.answerCbQuery();
-  await ctx.reply(`Выбрана воронка: ${category.NAME}\nВыберите стадию:`, Markup.inlineKeyboard(rows));
+  await ctx.reply(`Категория выбрана: ${cat.NAME}`);
+
+  // fetch stages
+  try {
+    const client = new BitrixClient(true);
+    const svc = new DealService(client);
+    const stages = await svc.getStages(Number(cat.ID));
+    s.stages = stages;
+    if (!stages.length) {
+      await ctx.reply("Стадии не найдены для этой воронки.");
+      return;
+    }
+    const buttons = stages.map((st: any) => Markup.button.callback(st.NAME, `stage_${st.STATUS_ID}`));
+    const rows: any[][] = [];
+    for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+    await ctx.reply("Выберите стадию:", Markup.inlineKeyboard(rows));
+  } catch (err: any) {
+    error(err);
+    await ctx.reply("Ошибка при получении стадий: " + String(err.message || err));
+  }
 });
 
 bot.action(/stage_(.+)/, async (ctx) => {
-  const id = ctx.match[1];
-  const session = getSession(ctx);
-  const client = new BitrixClient(true);
-  const svc = new DealService(client);
-  const stage = session.stages?.find((s: any) => String(s.STATUS_ID) === String(id));
-  session.stage = stage;
-  // fetch fields
-  const fields = await svc.getDealUserFields();
-  session.fields = fields;
-  // present numbered list and ask for index
-  const lines = fields.map((f, i) => `${i}: ${f.FIELD_NAME} (${f.USER_TYPE_ID ?? f.TYPE ?? "?"}) ${f.NAME ? "- " + f.NAME : ""}`);
-  const preview = lines.slice(0, 200).join("\n"); // but send full list
+  const id = ctx.match![1];
+  const chatId = ctx.chat!.id;
+  const s = getSession(chatId);
+  if (!s.stages) return;
+  const st = s.stages.find((x: any) => String(x.STATUS_ID) === String(id));
+  if (!st) {
+    await ctx.answerCbQuery("Стадия не найдена");
+    return;
+  }
+  s.stage = st;
   await ctx.answerCbQuery();
-  await ctx.reply("Выберите поле (отправьте индекс поля):\n" + lines.join("\n"));
-  session.step = "awaiting_field_index";
+  await ctx.reply(`Стадия выбрана: ${st.NAME}`);
+
+  // fetch fields and present numbered list (user inputs index)
+  try {
+    const client = new BitrixClient(true);
+    const svc = new DealService(client);
+    const fields = await svc.getDealUserFields();
+    s.fields = fields;
+
+    if (!fields || fields.length === 0) {
+      await ctx.reply("Пользовательские поля не найдены.");
+      return;
+    }
+
+    // build numbered list (may be long). We send in chunks if too long.
+    const lines = fields.map((f, i) => `${i}: ${f.FIELD_NAME} ${f.NAME ? "- " + f.NAME : ""} (${f.USER_TYPE_ID ?? f.TYPE ?? "?"})`);
+    // send in one message (limit ~4096 chars). If too long split:
+    const CHUNK = 1800;
+    let buf = "";
+    for (const line of lines) {
+      if (buf.length + line.length + 1 > CHUNK) {
+        await ctx.reply(buf);
+        buf = "";
+      }
+      buf += line + "\n";
+    }
+    if (buf.length) await ctx.reply(buf);
+
+    s.step = "awaiting_field_index";
+    await ctx.reply(`Отправьте индекс поля (0..${fields.length - 1}):`);
+  } catch (err: any) {
+    error(err);
+    await ctx.reply("Ошибка при получении полей: " + String(err.message || err));
+  }
 });
 
-bot.launch().then(() => info("Telegram bot launched"));
+// Start bot
+bot.launch().then(() => info("Bot launched")).catch(err => {
+  console.error("Failed to launch bot:", err);
+});
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
