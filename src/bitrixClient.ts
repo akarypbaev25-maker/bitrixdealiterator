@@ -31,7 +31,6 @@ export class BitrixClient {
 
   constructor(autoRefresh = true) {
     this.autoRefresh = autoRefresh;
-    // Try to load tokens.json
     if (fs.existsSync(TOKENS_PATH)) {
       try {
         const raw = fs.readFileSync(TOKENS_PATH, "utf-8");
@@ -42,7 +41,7 @@ export class BitrixClient {
         this.tokens = null;
       }
     } else {
-      // fallback: read environment variables (useful on Render)
+      // fallback to env (useful for initial bootstrap on Render)
       const domain = process.env.BITRIX_DOMAIN;
       const access = process.env.BITRIX_ACCESS_TOKEN;
       if (domain && access) {
@@ -53,7 +52,6 @@ export class BitrixClient {
           expires_in: process.env.BITRIX_EXPIRES_IN ? Number(process.env.BITRIX_EXPIRES_IN) : null,
           received_at: Date.now()
         };
-        // optionally save to file for visibility
         try {
           fs.writeFileSync(TOKENS_PATH, JSON.stringify(this.tokens, null, 2), "utf-8");
           debug("Saved tokens.json from env");
@@ -70,9 +68,7 @@ export class BitrixClient {
     return !!(this.tokens && this.tokens.domain && this.tokens.access_token);
   }
 
-  getTokens(): Tokens | null {
-    return this.tokens;
-  }
+  getTokens(): Tokens | null { return this.tokens; }
 
   saveTokensToFile(tokens: Tokens) {
     this.tokens = tokens;
@@ -88,7 +84,7 @@ export class BitrixClient {
     if (!this.autoRefresh) return;
     if (!this.tokens || !this.tokens.expires_in || !this.tokens.received_at) return;
     const expiresAt = (this.tokens.received_at ?? 0) + (this.tokens.expires_in ?? 0) * 1000;
-    if (Date.now() < expiresAt - 60_000) return; // still valid
+    if (Date.now() < expiresAt - 60_000) return;
     if (!this.tokens.refresh_token) throw new Error("No refresh_token available.");
     const client_id = process.env.BITRIX_CLIENT_ID;
     const client_secret = process.env.BITRIX_CLIENT_SECRET;

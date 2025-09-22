@@ -1,4 +1,4 @@
-import { BitrixClient, BitrixResponse } from "./bitrixClient";
+import { BitrixClient } from "./bitrixClient";
 import { info, warn } from "./logger";
 
 export type UserField = {
@@ -63,14 +63,9 @@ export class DealService {
     return all.slice(0, max);
   }
 
-  async getDeal(dealId: number) {
-    const res = await this.client.call<any>("crm.deal.get", { id: dealId, select: ["*", "UF_*"] });
-    return res.result;
-  }
-
   async updateDealSingle(dealId: number, fieldName: string, value: any, dryRun = false): Promise<{ success: boolean; returned?: any }> {
     if (dryRun) {
-      info(`Dry run: deal ${dealId} => ${fieldName} = ${JSON.stringify(value)}`);
+      info(`(dry) deal ${dealId} → ${fieldName} = ${JSON.stringify(value)}`);
       return { success: true };
     }
     const payload = { id: dealId, fields: { [fieldName]: value }, params: { REGISTER_SONET_EVENT: "N" } };
@@ -80,19 +75,18 @@ export class DealService {
 
   async updateDealsByIds(fieldName: string, value: string | number, dealIds: number[], dryRun = false): Promise<void> {
     const batchSize = 50;
-    const isMultiple = false; // if you want dynamic detection — pass metadata separately
+    const isMultiple = false;
     for (let i = 0; i < dealIds.length; i += batchSize) {
       const slice = dealIds.slice(i, i + batchSize);
       const cmd: Record<string, string> = {};
       slice.forEach((id, idx) => {
         const key = `u_${i + idx}`;
         const valForQuery = isMultiple ? JSON.stringify([value]) : String(value);
-        // Build cmd: crm.deal.update?ID=123&FIELDS[UF_FIELD]=value
         cmd[key] = `crm.deal.update?ID=${encodeURIComponent(String(id))}&FIELDS[${encodeURIComponent(fieldName)}]=${encodeURIComponent(valForQuery)}`;
       });
 
       if (dryRun) {
-        info(`Dry run: Batch ${i + 1}-${i + slice.length} -> ${fieldName}=${value}`);
+        info(`(dry) Batch update ${i + 1}-${i + slice.length} -> ${fieldName}=${value}`);
         continue;
       }
 
@@ -111,18 +105,21 @@ export class DealService {
   }
 
   /**
-   * Tag deals by groups (chunkSize default 150)
-   * opts.fieldType: 'string' | 'enum'
-   * opts.enumValues: IDs of enum values (used cyclically)
+   * Tag deals by groups.
+   * - fieldType: "string" | "enum"
+   * - stringPattern: optional pattern like "Group {n}" where {n} replaced by group number
+   * - enumValues: IDs to cycle through (if enum)
+   * - progressCb: optional async callback called after each group processed: (info) => void
    */
   async tagDealsByGroups(
     deals: any[],
     fieldName: string,
-    opts: { fieldType: "string" | "enum"; enumValues?: Array<string | number>; chunkSize?: number; dryRun?: boolean }
+    opts: { fieldType: "string" | "enum"; enumValues?: Array<string | number>; chunkSize?: number; dryRun?: boolean; stringPattern?: string; progressCb?: (info: { groupIndex: number; processed: number; totalGroups: number; groupSize: number }) => Promise<void> }
   ) {
     const chunkSize = opts.chunkSize ?? 150;
     const dryRun = !!opts.dryRun;
     const enumValues = opts.enumValues ?? [];
+    const totalGroups = Math.ceil(deals.length / chunkSize);
     let groupIndex = 0;
 
     for (let i = 0; i < deals.length; i += chunkSize) {
@@ -130,9 +127,9 @@ export class DealService {
       const subset = deals.slice(i, i + chunkSize);
       const ids = subset.map(d => Number(d.ID));
       if (opts.fieldType === "string") {
-        const value = String(groupIndex);
+        const pattern = opts.stringPattern ?? "{n}";
+        const value = pattern.replace("{n}", String(groupIndex));
         await this.updateDealsByIds(fieldName, value, ids, dryRun);
-        info(`Group ${groupIndex}: set ${fieldName}="${value}" for ${ids.length} deals`);
       } else {
         if (enumValues.length === 0) {
           warn("enumValues empty – cannot tag enum groups");
@@ -140,7 +137,10 @@ export class DealService {
         }
         const enumId = enumValues[(groupIndex - 1) % enumValues.length];
         await this.updateDealsByIds(fieldName, enumId, ids, dryRun);
-        info(`Group ${groupIndex}: set ${fieldName}=${enumId} for ${ids.length} deals`);
+      }
+
+      if (opts.progressCb) {
+        await opts.progressCb({ groupIndex, processed: Math.min(i + chunkSize, deals.length), totalGroups, groupSize: ids.length });
       }
     }
   }
