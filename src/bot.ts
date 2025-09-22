@@ -1,3 +1,4 @@
+// bot.ts — corrected and completed version
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -129,8 +130,8 @@ bot.on("text", async (ctx) => {
      }
      s.field = s.fields[idx];
      // detect type
-     const ut = (s.field as any).USER_TYPE_ID ?? (s.field as any).TYPE;
-     if (ut === "enumeration" || ((s.field as any).LIST && Array.isArray((s.field as any).LIST) && (s.field as any).LIST.length > 0)) {
+     const ut = s.field.USER_TYPE_ID ?? s.field.TYPE;
+     if (ut === "enumeration") {
        s.fieldType = "enum";
        // fetch enum values via DealService if possible
        try {
@@ -139,7 +140,7 @@ bot.on("text", async (ctx) => {
          s.enumValues = await svc.getEnumValuesForField(s.field!);
        } catch (err) {
          // fallback to field.LIST
-         s.enumValues = (s.field as any).LIST ?? [];
+         s.enumValues = s.field.LIST ?? [];
        }
 
 
@@ -156,11 +157,15 @@ bot.on("text", async (ctx) => {
          "Enum поле выбрано. Выберите режим:\n1 — Циклически (каждой группе своё значение циклично)\n2 — Один вариант для всех групп\nОтправьте 1 или 2."
        );
        return;
-     } else {
+     } else if (ut === "string") {
        // string field
        s.fieldType = "string";
        s.step = "awaiting_string_pattern";
        await ctx.reply("Введите строковый шаблон (используйте {n} как placeholder для номера группы). Пример: 'Group {n}' или просто '{n}':");
+       return;
+     } else {
+       await ctx.reply(`Тип поля '${ut}' не поддерживается (только enumeration или string). Выберите другое.`);
+       s.step = undefined;
        return;
      }
    }
@@ -214,6 +219,10 @@ bot.on("text", async (ctx) => {
    // --- max deals ---
    if (s.step === "awaiting_max") {
      s.maxDeals = text ? Number(text) : Infinity;
+     if (Number.isNaN(s.maxDeals) || s.maxDeals <= 0) {
+       await ctx.reply("Неверное число. Повторите.");
+       return;
+     }
      s.step = "awaiting_dry";
      await ctx.reply("Dry run? Отправьте yes (по умолчанию) или no:");
      return;
@@ -398,14 +407,14 @@ bot.action(/stage_(.+)/, async (ctx) => {
     const client = new BitrixClient(true);
     const svc = new DealService(client);
     const fields = await svc.getDealUserFields();
-    s.fields = fields;
+    s.fields = fields.filter(f => (f.USER_TYPE_ID === "enumeration" || f.USER_TYPE_ID === "string") && f.MULTIPLE !== "Y"); // filter supported types, exclude multiple for simplicity
 
-    if (!fields || fields.length === 0) {
-      await ctx.reply("Пользовательские поля не найдены.");
+    if (!s.fields || s.fields.length === 0) {
+      await ctx.reply("Подходящие пользовательские поля не найдены (только string/enumeration, не множественные).");
       return;
     }
 
-    const lines = fields.map((f, i) => `${i}: ${f.FIELD_NAME} ${f.NAME ? "- " + f.NAME : ""} (${f.USER_TYPE_ID ?? f.TYPE ?? "?"})`);
+    const lines = s.fields.map((f, i) => `${i}: ${f.FIELD_NAME} ${f.NAME ? "- " + f.NAME : ""} (${f.USER_TYPE_ID ?? f.TYPE ?? "?"})`);
     const CHUNK = 1800;
     let buf = "";
     for (const line of lines) {
@@ -418,7 +427,7 @@ bot.action(/stage_(.+)/, async (ctx) => {
     if (buf.length) await ctx.reply(buf);
 
     s.step = "awaiting_field_index";
-    await ctx.reply(`Отправьте индекс поля (0..${fields.length - 1}):`);
+    await ctx.reply(`Отправьте индекс поля (0..${s.fields.length - 1}):`);
   } catch (err: any) {
     error(err);
     await ctx.reply("Ошибка при получении полей: " + String(err.message || err));
