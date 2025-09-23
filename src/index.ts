@@ -37,29 +37,56 @@ async function ensureTokensInteractive() {
 
 async function main() {
   try {
-    // Ensure tokens exist or allow manual set
+    // Проверяем токены или даём ввести вручную
     await ensureTokensInteractive();
 
-    const dry = ((await question("Dry run? (yes/no) [yes]:")) || "yes").toLowerCase().startsWith("y");
+    const dry = ((await question("Запускать в режиме теста (без сохранения)? (да/нет) [да]:")) || "да")
+      .toLowerCase()
+      .startsWith("д");
     const client = new BitrixClient(true);
     if (!client.isConfigured()) {
-      console.error("Client still not configured. Exiting.");
+      console.error("Клиент не настроен. Завершение.");
       close();
       return;
     }
     const svc = new DealService(client);
 
-    info("Fetching deal categories...");
+    info("Загружаем список воронок...");
     const categories = await svc.getCategories();
-    const category = await chooseFrom(categories, (c: any) => `${c.NAME} (ID=${c.ID})`, "Выберите воронку (номер or ID):");
+    const category = await chooseFrom(categories, (c: any) => `${c.NAME} (ID=${c.ID})`, "Выберите воронку (номер или ID):");
 
-    info("Fetching stages...");
+    info("Загружаем стадии...");
     const stages = await svc.getStages(Number(category.ID));
-    const stage = await chooseFrom(stages, (s: any) => `${s.NAME} (STATUS_ID=${s.STATUS_ID})`, "Выберите стадию:");
 
-    info("Fetching user fields...");
+    // Показать список стадий с индексами
+    stages.forEach((s: any, i: number) => {
+      console.log(`${i}: ${s.NAME} (STATUS_ID=${s.STATUS_ID})`);
+    });
+
+    // Позволяем выбрать несколько индексов или ID через запятую
+    const stageInput = (await question("Введите номера стадий или STATUS_ID через запятую:")).trim();
+    const selectedStages: any[] = [];
+
+    stageInput.split(",").map(v => v.trim()).forEach(sel => {
+      // Если число → считаем индексом
+      if (/^\d+$/.test(sel)) {
+        const idx = Number(sel);
+        if (stages[idx]) selectedStages.push(stages[idx]);
+      } else {
+        // Иначе ищем по STATUS_ID
+        const found = stages.find((s: any) => s.STATUS_ID === sel);
+        if (found) selectedStages.push(found);
+      }
+    });
+
+    if (!selectedStages.length) {
+      console.error("Не выбрано ни одной стадии. Завершение.");
+      close();
+      return;
+    }
+
+    info("Загружаем пользовательские поля сделок...");
     const ufs = await svc.getDealUserFields();
-    // split into enum and string candidates
     const enumFields = ufs.filter(f => {
       const ut = (f as any).USER_TYPE_ID ?? (f as any).TYPE;
       return ut === "enumeration" || (f.LIST && Array.isArray(f.LIST) && f.LIST.length > 0);
@@ -71,22 +98,22 @@ async function main() {
 
     let field: UserField;
     let fieldType: "enum" | "string" = "enum";
-    const typeChoice = (await question("Work with enum or string field? [enum]:")) || "enum";
+    const typeChoice = (await question("Работать с enum или строковым полем? [enum]:")) || "enum";
     if (typeChoice.trim().toLowerCase() === "string") {
       fieldType = "string";
       if (stringFields.length === 0) {
-        const manual = (await question("No string fields found. Enter FIELD_NAME (UF_CRM_...):")).trim();
+        const manual = (await question("Строковых полей не найдено. Введите FIELD_NAME (UF_CRM_...):")).trim();
         field = { ID: manual, FIELD_NAME: manual } as UserField;
       } else {
         field = await chooseFrom(stringFields, (f: any) => `${f.FIELD_NAME} / ${f.NAME ?? f.ID}`, "Выберите строковое поле:");
       }
     } else {
       if (enumFields.length === 0) {
-        info("No enum fields found, switching to string");
+        info("Enum-поля не найдены, переключаемся на строковые");
         fieldType = "string";
         field = await chooseFrom(stringFields, (f: any) => `${f.FIELD_NAME} / ${f.NAME ?? f.ID}`, "Выберите строковое поле:");
       } else {
-        field = await chooseFrom(enumFields, (f: any) => `${f.FIELD_NAME} / ${f.NAME ?? f.ID}`, "Выберите enum поле:");
+        field = await chooseFrom(enumFields, (f: any) => `${f.FIELD_NAME} / ${f.NAME ?? f.ID}`, "Выберите enum-поле:");
       }
     }
 
@@ -94,29 +121,29 @@ async function main() {
     if (fieldType === "enum") {
       enumValues = await svc.getEnumValuesForField(field);
       if (!enumValues.length) {
-        info("Enum field has no values. Exiting.");
+        info("Enum-поле не содержит значений. Завершение.");
         close();
         return;
       }
       enumValues.forEach((v, i) => info(`${i}: ID=${v.ID} => ${v.VALUE ?? v.NAME}`));
     }
 
-    const maxInput = await question("Max deals to process (Enter = all): ");
+    const maxInput = await question("Максимальное количество сделок для обработки (Enter = все): ");
     const max = maxInput ? Number(maxInput) : Infinity;
 
-    info("Fetching deals...");
-    const filter: any = { CATEGORY_ID: Number(category.ID), STAGE_ID: stage.STATUS_ID };
+    info("Загружаем сделки...");
+    const filter: any = { CATEGORY_ID: Number(category.ID), STAGE_ID: selectedStages.map(s => s.STATUS_ID) };
     const deals = await svc.fetchDealsPaginated(filter, ["*", "UF_*"], { DATE_CREATE: "ASC" }, max);
-    info(`Found deals: ${deals.length}`);
+    info(`Найдено сделок: ${deals.length}`);
     if (!deals.length) {
-      info("No deals found.");
+      info("Сделок не найдено.");
       close();
       return;
     }
 
-    const confirm = (await question(`Proceed to mark ${deals.length} deals? (yes/no) [no]:`)).toLowerCase();
-    if (!["y","yes"].includes(confirm)) {
-      info("Aborted by user.");
+    const confirm = (await question(`Перейти к обработке ${deals.length} сделок? (да/нет) [нет]:`)).toLowerCase();
+    if (!["д","да","yes","y"].includes(confirm)) {
+      info("Операция отменена пользователем.");
       close();
       return;
     }
@@ -128,12 +155,13 @@ async function main() {
       dryRun: dry
     });
 
-    info("Done.");
+    info("Готово.");
     close();
   } catch (err) {
-    console.error("Error:", err);
+    console.error("Ошибка:", err);
     try { close(); } catch {}
   }
 }
+
 
 main();
